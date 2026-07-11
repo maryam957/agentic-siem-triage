@@ -1,0 +1,48 @@
+[
+  {
+    "id": "ALT-2026-001",
+    "timestamp": "2026-07-11T14:32:00Z",
+    "source": "CrowdStrike Falcon",
+    "severity": "high",
+    "title": "Suspicious PowerShell execution",
+    "description": "Encoded PowerShell command detected on WORKSTATION-42",
+    "host": "WORKSTATION-42",
+    "user": "jsmith",
+    "mitre_tactics": ["Execution", "Defense Evasion"],
+    "raw_event": {
+      "process": "powershell.exe",
+      "command_line": "powershell -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA"
+    }
+  },
+  {
+    "id": "ALT-2026-002",
+    "timestamp": "2026-07-11T15:10:22Z",
+    "source": "Microsoft Sentinel",
+    "severity": "medium",
+    "title": "Impossible travel sign-in",
+    "description": "User signed in from US and Germany within 30 minutes",
+    "host": null,
+    "user": "admin@contoso.com",
+    "mitre_tactics": ["Initial Access"],
+    "raw_event": {
+      "ip_addresses": ["203.0.113.10", "198.51.100.44"],
+      "locations": ["New York, US", "Frankfurt, DE"]
+    }
+  },
+  {
+    "id": "ALT-2026-003",
+    "timestamp": "2026-07-11T16:45:00Z",
+    "source": "Palo Alto Cortex",
+    "severity": "critical",
+    "title": "C2 beacon detected",
+    "description": "Outbound connection to known C2 domain evil-c2.example",
+    "host": "SERVER-DB-01",
+    "user": "SYSTEM",
+    "mitre_tactics": ["Command and Control", "Exfiltration"],
+    "raw_event": {
+      "destination": "evil-c2.example",
+      "port": 443,
+      "bytes_sent": 4096
+    }
+  }
+]
