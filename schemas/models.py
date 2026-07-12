@@ -3,24 +3,23 @@ from typing import Optional
 
 @dataclass
 class RawAlert:
-    alert_id: str
+    id: str
     timestamp: str
-    src_ip: str
-    dst_ip: str
-    src_port: int
-    dst_port: int
-    protocol: str
-    alert_type: str       # e.g. "ET SCAN Nmap"
-    severity: int         # 1-3 from Suricata
-    affected_host: str
-    raw_payload: dict
+    source: str
+    severity: str
+    title: str
+    description: str
+    host: Optional[str]
+    user: str
+    mitre_tactics: list[str]
+    raw_event: dict
 
 @dataclass
 class EnrichedContext:
     alert: RawAlert
     ip_reputation: dict   # VirusTotal response
     abuse_score: int      # AbuseIPDB score 0-100
-    related_logs: list    # last 24hr logs for this IP
+    related_logs: list    # last 24hr logs for this alert or entity
     whois_info: dict
 
 @dataclass

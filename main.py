@@ -1,14 +1,12 @@
-"""Agentic SIEM Triage — entry point."""
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-def main() -> None:
-  print("Agentic SIEM Triage")
-  print("Run the HITL dashboard: uvicorn ui.app:app --reload")
+from agents.graph import graph
 
 
 if __name__ == "__main__":
-  main()
+
+    result = graph.invoke(
+        {
+            "alert_path": "alerts/sample_alerts.json"
+        }
+    )
+
+    print("\nPipeline completed.")
