@@ -1,6 +1,8 @@
-"""IP threat enrichment via VirusTotal and AbuseIPDB."""
+"""IP threat enrichment via VirusTotal, AbuseIPDB, and related logs."""
 
+from collections.abc import Mapping
 import os
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -80,6 +82,118 @@ def check_ip_abuseipdb(ip: str, max_age_days: int = 90) -> dict:
     "num_distinct_users": data.get("numDistinctUsers", 0),
     "last_reported_at": data.get("lastReportedAt"),
     "raw": payload,
+  }
+
+
+def _read_field(alert: Any, field_name: str, default: Any = None) -> Any:
+  if isinstance(alert, Mapping):
+    return alert.get(field_name, default)
+  return getattr(alert, field_name, default)
+
+
+def _extract_primary_ip(alert: Any) -> str | None:
+  raw_event = _read_field(alert, "raw_event", {}) or {}
+  candidates = [
+    _read_field(alert, "src_ip"),
+    _read_field(alert, "dst_ip"),
+    _read_field(alert, "ip"),
+    raw_event.get("src_ip"),
+    raw_event.get("source_ip"),
+    raw_event.get("dst_ip"),
+    raw_event.get("destination_ip"),
+    raw_event.get("remote_ip"),
+    raw_event.get("ip"),
+  ]
+
+  ip_addresses = raw_event.get("ip_addresses", [])
+  if isinstance(ip_addresses, list):
+    candidates.extend(ip_addresses)
+
+  for candidate in candidates:
+    if isinstance(candidate, str) and candidate:
+      return candidate
+  return None
+
+
+def _extract_host(alert: Any) -> str | None:
+  host = _read_field(alert, "host")
+  if isinstance(host, str) and host:
+    return host
+
+  raw_event = _read_field(alert, "raw_event", {}) or {}
+  for key in ("host", "hostname", "asset", "device_name"):
+    value = raw_event.get(key)
+    if isinstance(value, str) and value:
+      return value
+  return None
+
+
+def get_related_logs(ip: str | None, host: str | None) -> list[dict[str, Any]]:
+  """Return hardcoded related log examples for the given IP or host."""
+  return [
+    {
+      "timestamp": "2026-07-14T08:12:09Z",
+      "source": "Windows Security",
+      "host": host,
+      "ip": ip,
+      "event": "authentication failure",
+      "message": "Multiple failed logon attempts from the same source were observed.",
+    },
+    {
+      "timestamp": "2026-07-14T08:12:41Z",
+      "source": "EDR",
+      "host": host,
+      "ip": ip,
+      "event": "suspicious network connection",
+      "message": "Process spawned a network session that matches the alert context.",
+    },
+    {
+      "timestamp": "2026-07-14T08:13:02Z",
+      "source": "SIEM Correlation",
+      "host": host,
+      "ip": ip,
+      "event": "correlated activity",
+      "message": "Related activity tied together by source IP and affected host.",
+    },
+  ]
+
+
+def _safe_lookup(func, *args, **kwargs) -> dict[str, Any]:
+  try:
+    return func(*args, **kwargs)
+  except Exception as exc:
+    return {
+      "source": func.__name__,
+      "error": str(exc),
+    }
+
+
+def enrich(alert: Any) -> dict[str, Any]:
+  """Combine threat intel and context around a single alert."""
+  ip = _extract_primary_ip(alert)
+  host = _extract_host(alert)
+
+  virustotal = _safe_lookup(check_ip_virustotal, ip) if ip else {"source": "virustotal", "error": "no IP found in alert"}
+  abuseipdb = _safe_lookup(check_ip_abuseipdb, ip) if ip else {"source": "abuseipdb", "error": "no IP found in alert"}
+  related_logs = get_related_logs(ip, host)
+
+  alert_payload: dict[str, Any]
+  if isinstance(alert, Mapping):
+    alert_payload = dict(alert)
+  elif hasattr(alert, "model_dump"):
+    alert_payload = alert.model_dump()
+  elif hasattr(alert, "__dict__"):
+    alert_payload = dict(alert.__dict__)
+  else:
+    alert_payload = {"value": str(alert)}
+
+  return {
+    "alert": alert_payload,
+    "ip": ip,
+    "host": host,
+    "virustotal": virustotal,
+    "abuseipdb": abuseipdb,
+    "related_logs": related_logs,
   }
 
 

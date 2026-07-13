@@ -1,48 +1,263 @@
 [
   {
     "id": "ALT-2026-001",
-    "timestamp": "2026-07-11T14:32:00Z",
-    "source": "CrowdStrike Falcon",
+    "timestamp": "2026-07-11T08:02:00Z",
+    "source": "Suricata",
     "severity": "high",
-    "title": "Suspicious PowerShell execution",
-    "description": "Encoded PowerShell command detected on WORKSTATION-42",
-    "host": "WORKSTATION-42",
-    "user": "jsmith",
-    "mitre_tactics": ["Execution", "Defense Evasion"],
+    "title": "SSH brute force against bastion",
+    "description": "Repeated SSH failures against the bastion host from a single source IP.",
+    "host": "BASTION-01",
+    "user": "root",
+    "mitre_tactics": ["Initial Access", "Credential Access"],
     "raw_event": {
-      "process": "powershell.exe",
-      "command_line": "powershell -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA"
+      "src_ip": "203.0.113.20",
+      "dst_ip": "10.0.10.12",
+      "dst_port": 22,
+      "attempts": 87,
+      "window_minutes": 10
     }
   },
   {
     "id": "ALT-2026-002",
-    "timestamp": "2026-07-11T15:10:22Z",
-    "source": "Microsoft Sentinel",
-    "severity": "medium",
-    "title": "Impossible travel sign-in",
-    "description": "User signed in from US and Germany within 30 minutes",
-    "host": null,
-    "user": "admin@contoso.com",
-    "mitre_tactics": ["Initial Access"],
+    "timestamp": "2026-07-11T08:08:00Z",
+    "source": "CrowdStrike Falcon",
+    "severity": "high",
+    "title": "SSH brute force on Linux server",
+    "description": "Root login attempts failed repeatedly against the production Linux server.",
+    "host": "LINUX-API-02",
+    "user": "root",
+    "mitre_tactics": ["Initial Access", "Credential Access"],
     "raw_event": {
-      "ip_addresses": ["203.0.113.10", "198.51.100.44"],
-      "locations": ["New York, US", "Frankfurt, DE"]
+      "src_ip": "198.51.100.41",
+      "dst_ip": "10.20.30.41",
+      "dst_port": 22,
+      "attempts": 64,
+      "window_minutes": 5
     }
   },
   {
     "id": "ALT-2026-003",
-    "timestamp": "2026-07-11T16:45:00Z",
+    "timestamp": "2026-07-11T08:14:00Z",
     "source": "Palo Alto Cortex",
-    "severity": "critical",
-    "title": "C2 beacon detected",
-    "description": "Outbound connection to known C2 domain evil-c2.example",
-    "host": "SERVER-DB-01",
-    "user": "SYSTEM",
+    "severity": "medium",
+    "title": "SSH brute force from external scanner",
+    "description": "Short burst of SSH authentication failures observed on an internet-facing endpoint.",
+    "host": "JUMPBOX-03",
+    "user": "ubuntu",
+    "mitre_tactics": ["Initial Access", "Credential Access"],
+    "raw_event": {
+      "src_ip": "192.0.2.58",
+      "dst_ip": "10.0.20.9",
+      "dst_port": 22,
+      "attempts": 31,
+      "window_minutes": 3
+    }
+  },
+  {
+    "id": "ALT-2026-004",
+    "timestamp": "2026-07-11T09:00:00Z",
+    "source": "Suricata",
+    "severity": "medium",
+    "title": "Port scan detected on perimeter",
+    "description": "Sequential connection attempts across multiple ports were observed from a single source.",
+    "host": "EDGE-FW-01",
+    "user": null,
+    "mitre_tactics": ["Reconnaissance"],
+    "raw_event": {
+      "src_ip": "203.0.113.77",
+      "dst_ip": "10.0.0.1",
+      "scan_type": "SYN",
+      "ports_scanned": [22, 80, 135, 139, 443, 3389]
+    }
+  },
+  {
+    "id": "ALT-2026-005",
+    "timestamp": "2026-07-11T09:06:00Z",
+    "source": "Microsoft Sentinel",
+    "severity": "medium",
+    "title": "Port scan against web tier",
+    "description": "Multiple destination ports hit in a short interval against the public web tier.",
+    "host": "WEB-01",
+    "user": null,
+    "mitre_tactics": ["Reconnaissance"],
+    "raw_event": {
+      "src_ip": "198.51.100.77",
+      "dst_ip": "10.0.40.15",
+      "scan_type": "TCP connect",
+      "ports_scanned": [21, 22, 25, 53, 110, 443, 8080]
+    }
+  },
+  {
+    "id": "ALT-2026-006",
+    "timestamp": "2026-07-11T09:12:00Z",
+    "source": "CrowdStrike Falcon",
+    "severity": "low",
+    "title": "Port scan from test harness",
+    "description": "Port sweep activity observed from a lab host used for validation testing.",
+    "host": "LAB-NODE-04",
+    "user": "tester",
+    "mitre_tactics": ["Reconnaissance"],
+    "raw_event": {
+      "src_ip": "192.0.2.88",
+      "dst_ip": "10.0.50.22",
+      "scan_type": "UDP",
+      "ports_scanned": [53, 67, 123, 161]
+    }
+  },
+  {
+    "id": "ALT-2026-007",
+    "timestamp": "2026-07-11T10:01:00Z",
+    "source": "Palo Alto Cortex",
+    "severity": "high",
+    "title": "Suspicious outbound to rare ASN",
+    "description": "Endpoint initiated outbound traffic to an uncommon ASN and uncommon destination host.",
+    "host": "WORKSTATION-42",
+    "user": "jsmith",
     "mitre_tactics": ["Command and Control", "Exfiltration"],
     "raw_event": {
-      "destination": "evil-c2.example",
-      "port": 443,
-      "bytes_sent": 4096
+      "dst_ip": "203.0.113.200",
+      "dst_port": 443,
+      "bytes_sent": 1843200,
+      "bytes_received": 4096,
+      "destination": "cdn-asset-sync.example"
+    }
+  },
+  {
+    "id": "ALT-2026-008",
+    "timestamp": "2026-07-11T10:07:00Z",
+    "source": "Microsoft Defender for Endpoint",
+    "severity": "critical",
+    "title": "Suspicious outbound DNS tunneling",
+    "description": "High-volume DNS traffic to a rarely seen domain suggests possible tunneling.",
+    "host": "FILESERVER-07",
+    "user": "svc-backup",
+    "mitre_tactics": ["Command and Control", "Exfiltration"],
+    "raw_event": {
+      "dst_ip": "198.51.100.202",
+      "dst_port": 53,
+      "queries": 418,
+      "bytes_sent": 912384,
+      "destination": "logs-sync.example"
+    }
+  },
+  {
+    "id": "ALT-2026-009",
+    "timestamp": "2026-07-11T10:13:00Z",
+    "source": "Suricata",
+    "severity": "high",
+    "title": "Suspicious outbound to known bad netblock",
+    "description": "Outbound session established to a low-reputation IP with repeated retries.",
+    "host": "APP-DB-03",
+    "user": "SYSTEM",
+    "mitre_tactics": ["Command and Control"],
+    "raw_event": {
+      "dst_ip": "192.0.2.150",
+      "dst_port": 8443,
+      "bytes_sent": 65536,
+      "bytes_received": 1024,
+      "destination": "api-cache.example"
+    }
+  },
+  {
+    "id": "ALT-2026-010",
+    "timestamp": "2026-07-11T11:00:00Z",
+    "source": "Microsoft Sentinel",
+    "severity": "medium",
+    "title": "Failed login spike on VPN",
+    "description": "Dozens of failed VPN logins for the same user in a short time window.",
+    "host": "VPN-GW-01",
+    "user": "admin@contoso.com",
+    "mitre_tactics": ["Credential Access", "Persistence"],
+    "raw_event": {
+      "src_ip": "203.0.113.55",
+      "failed_logins": 58,
+      "window_minutes": 15,
+      "authentication_method": "MFA push"
+    }
+  },
+  {
+    "id": "ALT-2026-011",
+    "timestamp": "2026-07-11T11:06:00Z",
+    "source": "Okta",
+    "severity": "high",
+    "title": "Failed login spike on SaaS tenant",
+    "description": "Large burst of failed password authentications against the same cloud account.",
+    "host": null,
+    "user": "finance-admin@contoso.com",
+    "mitre_tactics": ["Credential Access"],
+    "raw_event": {
+      "src_ip": "198.51.100.61",
+      "failed_logins": 124,
+      "window_minutes": 10,
+      "application": "workday"
+    }
+  },
+  {
+    "id": "ALT-2026-012",
+    "timestamp": "2026-07-11T11:12:00Z",
+    "source": "CrowdStrike Falcon",
+    "severity": "medium",
+    "title": "Failed login spike on domain controller",
+    "description": "Repeated Kerberos failures detected against the same domain account.",
+    "host": "DC-02",
+    "user": "svc_sql",
+    "mitre_tactics": ["Credential Access"],
+    "raw_event": {
+      "src_ip": "192.0.2.99",
+      "failed_logins": 41,
+      "window_minutes": 5,
+      "authentication_protocol": "Kerberos"
+    }
+  },
+  {
+    "id": "ALT-2026-013",
+    "timestamp": "2026-07-11T12:03:00Z",
+    "source": "Threat Intel Feed",
+    "severity": "critical",
+    "title": "Connection to known malicious IP",
+    "description": "Endpoint contacted an IP flagged by external threat intelligence as malicious.",
+    "host": "DESKTOP-19",
+    "user": "mgreen",
+    "mitre_tactics": ["Command and Control", "Exfiltration"],
+    "raw_event": {
+      "dst_ip": "185.220.101.45",
+      "dst_port": 443,
+      "ioc_source": "external threat feed",
+      "ioc_confidence": "high"
+    }
+  },
+  {
+    "id": "ALT-2026-014",
+    "timestamp": "2026-07-11T12:09:00Z",
+    "source": "Microsoft Defender for Endpoint",
+    "severity": "high",
+    "title": "Known malicious IP seen on mail gateway",
+    "description": "Outbound mail gateway traffic matched a previously blocked malicious IP indicator.",
+    "host": "MAIL-GW-01",
+    "user": null,
+    "mitre_tactics": ["Command and Control"],
+    "raw_event": {
+      "dst_ip": "45.83.64.1",
+      "dst_port": 25,
+      "ioc_source": "blocklist",
+      "ioc_confidence": "medium"
+    }
+  },
+  {
+    "id": "ALT-2026-015",
+    "timestamp": "2026-07-11T12:15:00Z",
+    "source": "Palo Alto Cortex",
+    "severity": "critical",
+    "title": "Known malicious IP from workstation",
+    "description": "Workstation attempted to reach a confirmed malicious IP associated with active campaigns.",
+    "host": "WORKSTATION-07",
+    "user": "ajones",
+    "mitre_tactics": ["Command and Control", "Exfiltration"],
+    "raw_event": {
+      "dst_ip": "91.92.109.126",
+      "dst_port": 8080,
+      "ioc_source": "SIEM correlation",
+      "ioc_confidence": "high"
     }
   }
 ]
