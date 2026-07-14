@@ -54,15 +54,71 @@ def ingest_alert(state):
 
 
 def enrichment_node(state):
-    """
-    Enrich the alert using external threat intelligence.
-    """
-
     alert = state["alert"]
 
     enriched = enrich(alert)
 
     state["enriched"] = enriched
+
+    print("\n" + "=" * 70)
+    print("🔍 ENRICHMENT RESULT")
+    print("=" * 70)
+
+    print(f"Source IP      : {enriched['ip']}")
+    print(f"Host           : {enriched['host']}")
+
+    print("\nVirusTotal")
+    print("-" * 70)
+    vt = enriched["virustotal"]
+    for key, value in vt.items():
+        if key != "raw":
+            print(f"{key:22}: {value}")
+
+    print("\nAbuseIPDB")
+    print("-" * 70)
+    abuse = enriched["abuseipdb"]
+    for key, value in abuse.items():
+        if key != "raw":
+            print(f"{key:22}: {value}")
+
+    print("\nRelated Logs")
+    print("-" * 70)
+    for i, log in enumerate(enriched["related_logs"], start=1):
+        print(f"[{i}] {log['timestamp']}")
+        print(f"    Source : {log['source']}")
+        print(f"    Event  : {log['event']}")
+        print(f"    Message: {log['message']}")
+        print()
+
+    print("=" * 70)
+
+    print(f"Source IP      : {enriched['ip']}")
+    print(f"Host           : {enriched['host']}")
+
+    print("\nVirusTotal")
+    print("-" * 70)
+    vt = enriched["virustotal"]
+    for key, value in vt.items():
+        if key != "raw":
+            print(f"{key:22}: {value}")
+
+    print("\nAbuseIPDB")
+    print("-" * 70)
+    abuse = enriched["abuseipdb"]
+    for key, value in abuse.items():
+        if key != "raw":
+            print(f"{key:22}: {value}")
+
+    print("\nRelated Logs")
+    print("-" * 70)
+    for i, log in enumerate(enriched["related_logs"], start=1):
+        print(f"[{i}] {log['timestamp']}")
+        print(f"    Source : {log['source']}")
+        print(f"    Event  : {log['event']}")
+        print(f"    Message: {log['message']}")
+        print()
+
+    print("=" * 70)
 
     return state
 
