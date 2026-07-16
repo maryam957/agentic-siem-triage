@@ -1,7 +1,12 @@
 """IP threat enrichment via VirusTotal, AbuseIPDB, and related logs."""
 
 from collections.abc import Mapping
+from datetime import datetime
+from functools import lru_cache
+import json
 import os
+from pathlib import Path
+import re
 from typing import Any
 
 import requests
@@ -12,6 +17,20 @@ load_dotenv()
 VIRUSTOTAL_API_URL = "https://www.virustotal.com/api/v3/ip_addresses/{ip}"
 ABUSEIPDB_API_URL = "https://api.abuseipdb.com/api/v2/check"
 REQUEST_TIMEOUT = 30
+ATTACK_JSON_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
+ATTACK_JSON_PATH = Path(__file__).resolve().parent / "data" / "attack.json"
+WORD_RE = re.compile(r"[a-z0-9_\-]{3,}")
+STOPWORDS = {
+  "the", "and", "for", "with", "from", "that", "this", "into", "over", "under", "was", "were", "are",
+  "alert", "event", "host", "user", "source", "destination", "network", "traffic", "detected", "against",
+}
+BEHAVIOR_TTP_HINTS: list[tuple[tuple[str, ...], list[str]]] = [
+  (("brute force", "ssh"), ["T1110", "T1110.001", "T1021.004"]),
+  (("port scan", "scan"), ["T1046"]),
+  (("dns tunneling", "dns tunnel"), ["T1071.004", "T1048.003"]),
+  (("malicious ip", "known malicious", "command and control", "outbound"), ["T1071", "T1105", "T1041"]),
+  (("failed login", "authentication failure"), ["T1110"]),
+]
 
 
 def _get_api_key(env_var: str) -> str:
@@ -166,6 +185,323 @@ def _safe_lookup(func, *args, **kwargs) -> dict[str, Any]:
       "source": func.__name__,
       "error": str(exc),
     }
+
+
+def _tokenize(text: str) -> set[str]:
+  tokens = {
+    token
+    for token in WORD_RE.findall(text.lower())
+    if token not in STOPWORDS
+  }
+  return tokens
+
+
+def _parse_timestamp(value: Any) -> datetime:
+  if not isinstance(value, str) or not value:
+    return datetime.max
+
+  normalized = value.replace("Z", "+00:00")
+  try:
+    return datetime.fromisoformat(normalized)
+  except ValueError:
+    return datetime.max
+
+
+def _ensure_attack_json() -> Path:
+  if ATTACK_JSON_PATH.exists():
+    return ATTACK_JSON_PATH
+
+  ATTACK_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+  response = requests.get(ATTACK_JSON_URL, timeout=REQUEST_TIMEOUT)
+  response.raise_for_status()
+  ATTACK_JSON_PATH.write_text(response.text, encoding="utf-8")
+  return ATTACK_JSON_PATH
+
+
+@lru_cache(maxsize=1)
+def _load_attack_patterns() -> list[dict[str, Any]]:
+  path = _ensure_attack_json()
+  payload = json.loads(path.read_text(encoding="utf-8"))
+
+  objects = payload.get("objects", [])
+  patterns: list[dict[str, Any]] = []
+
+  for obj in objects:
+    if obj.get("type") != "attack-pattern":
+      continue
+    if obj.get("revoked") or obj.get("x_mitre_deprecated"):
+      continue
+
+    external_refs = obj.get("external_references", [])
+    attack_id = None
+    for ref in external_refs:
+      if ref.get("source_name") == "mitre-attack" and isinstance(ref.get("external_id"), str):
+        attack_id = ref["external_id"]
+        break
+
+    if not attack_id:
+      continue
+
+    name = obj.get("name", "")
+    description = obj.get("description", "")
+    patterns.append(
+      {
+        "id": attack_id,
+        "name": name,
+        "description": description,
+        "tokens": _tokenize(f"{name} {description}"),
+      }
+    )
+
+  return patterns
+
+
+def get_ttps(behavior: str, limit: int = 5) -> list[str]:
+  """Map behavior text to likely MITRE ATT&CK technique IDs from attack.json."""
+  if not isinstance(behavior, str) or not behavior.strip():
+    return []
+
+  behavior_lower = behavior.lower()
+  prioritized: list[str] = []
+  for keywords, ttps in BEHAVIOR_TTP_HINTS:
+    if any(keyword in behavior_lower for keyword in keywords):
+      for ttp in ttps:
+        if ttp not in prioritized:
+          prioritized.append(ttp)
+        if len(prioritized) >= limit:
+          return prioritized
+
+  behavior_tokens = _tokenize(behavior)
+  if not behavior_tokens:
+    return prioritized[:limit]
+
+  scored: list[tuple[int, str]] = []
+  for pattern in _load_attack_patterns():
+    overlap = len(behavior_tokens.intersection(pattern["tokens"]))
+    if overlap == 0:
+      continue
+    scored.append((overlap, pattern["id"]))
+
+  scored.sort(key=lambda item: (-item[0], item[1]))
+
+  ordered_ids: list[str] = list(prioritized)
+  for _, attack_id in scored:
+    if attack_id not in ordered_ids:
+      ordered_ids.append(attack_id)
+    if len(ordered_ids) >= limit:
+      break
+
+  return ordered_ids
+
+
+def timeline_builder(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  """Order logs by timestamp and normalize each event to a plain dict."""
+  ordered_logs = sorted(logs or [], key=lambda item: _parse_timestamp(item.get("timestamp")))
+
+  timeline: list[dict[str, Any]] = []
+  for log in ordered_logs:
+    timeline.append(
+      {
+        "timestamp": log.get("timestamp"),
+        "source": log.get("source"),
+        "event": log.get("event"),
+        "message": log.get("message"),
+        "ip": log.get("ip"),
+        "host": log.get("host"),
+      }
+    )
+  return timeline
+
+
+def build_correlation_prompt(context: dict[str, Any]) -> str:
+  """Build a Gemini prompt that defines each field and requests strict JSON output."""
+  compact_context = _compact_context_for_prompt(context)
+  return f"""
+You are a SOC Tier-2 triage assistant. Correlate this alert context and produce a concise risk decision.
+
+Field definitions:
+- alert: Primary SIEM alert object.
+  - id/alert_id: unique alert identifier.
+  - title/alert_type: short label for suspicious behavior.
+  - description: analyst-friendly summary of what happened.
+  - severity: original platform severity (low/medium/high/critical or numeric).
+  - timestamp: when the alert was generated.
+  - host/affected_host: impacted endpoint or server.
+  - user: related identity if known.
+  - raw_event/raw_payload: detector-specific telemetry (IPs, ports, attempts, bytes, protocol).
+- ip: primary observable selected for enrichment.
+- host: normalized host value used for correlation.
+- virustotal: external reputation data.
+  - reputation: aggregate score; lower can indicate risk.
+  - last_analysis_stats.malicious/suspicious: count of engines flagging the IP.
+  - tags/as_owner/country: infrastructure context.
+- abuseipdb: abuse intelligence.
+  - abuse_confidence_score (0-100): higher means more abuse reports.
+  - total_reports/last_reported_at/is_tor: confidence boosters for maliciousness.
+- related_logs: nearby telemetry events used for sequence reconstruction.
+
+Your output goals:
+1) Estimate triage score (0-100), where higher = higher incident risk.
+2) Provide a severity_label in [low, medium, high].
+3) Summarize behavior in one sentence for ATT&CK mapping.
+4) Return likely MITRE ATT&CK technique IDs (Txxxx format only).
+5) Give short reasoning and concrete next actions.
+
+Return valid JSON only with this exact schema:
+{{
+  "score": <int 0-100>,
+  "severity_label": "low|medium|high",
+  "behavior_summary": "<string>",
+  "ttps": ["Txxxx", "Txxxx"],
+  "reasoning": "<2-4 sentence explanation>",
+  "recommended_actions": ["<action>", "<action>"]
+}}
+
+Context JSON:
+{json.dumps(compact_context, indent=2)}
+
+If evidence is weak or conflicting, reduce confidence and mention uncertainty explicitly in reasoning.
+""".strip()
+
+
+def _compact_context_for_prompt(context: dict[str, Any]) -> dict[str, Any]:
+  """Keep prompt context concise to reduce token usage and model drift."""
+  alert = context.get("alert", {}) or {}
+  vt = context.get("virustotal", {}) or {}
+  vt_stats = vt.get("last_analysis_stats", {}) if isinstance(vt, Mapping) else {}
+  abuse = context.get("abuseipdb", {}) or {}
+
+  return {
+    "alert": {
+      "id": alert.get("id") or alert.get("alert_id"),
+      "timestamp": alert.get("timestamp"),
+      "title": alert.get("title") or alert.get("alert_type"),
+      "description": alert.get("description"),
+      "severity": alert.get("severity"),
+      "host": alert.get("host") or alert.get("affected_host"),
+      "user": alert.get("user"),
+      "raw_event": alert.get("raw_event") or alert.get("raw_payload"),
+    },
+    "ip": context.get("ip"),
+    "host": context.get("host"),
+    "virustotal": {
+      "reputation": vt.get("reputation"),
+      "country": vt.get("country"),
+      "as_owner": vt.get("as_owner"),
+      "tags": vt.get("tags", []),
+      "last_analysis_stats": {
+        "malicious": vt_stats.get("malicious", 0),
+        "suspicious": vt_stats.get("suspicious", 0),
+        "harmless": vt_stats.get("harmless", 0),
+      },
+    },
+    "abuseipdb": {
+      "abuse_confidence_score": abuse.get("abuse_confidence_score", 0),
+      "total_reports": abuse.get("total_reports", 0),
+      "last_reported_at": abuse.get("last_reported_at"),
+      "is_tor": abuse.get("is_tor", False),
+    },
+    "related_logs": timeline_builder(context.get("related_logs", []))[-10:],
+  }
+
+
+def _normalize_severity_label(score: int) -> str:
+  if score >= 70:
+    return "high"
+  if score >= 40:
+    return "medium"
+  return "low"
+
+
+def _heuristic_reasoning(context: dict[str, Any]) -> dict[str, Any]:
+  alert = context.get("alert", {}) or {}
+  title = str(alert.get("alert_type") or alert.get("title") or "").lower()
+  description = str(alert.get("description") or "")
+
+  vt = context.get("virustotal", {}) or {}
+  vt_stats = vt.get("last_analysis_stats", {}) if isinstance(vt, Mapping) else {}
+  vt_malicious = int(vt_stats.get("malicious", 0) or 0)
+  vt_suspicious = int(vt_stats.get("suspicious", 0) or 0)
+
+  abuse = context.get("abuseipdb", {}) or {}
+  abuse_score = int(abuse.get("abuse_confidence_score", 0) or 0)
+
+  severity = alert.get("severity")
+  severity_seed = 0
+  if isinstance(severity, int):
+    severity_seed = {1: 20, 2: 40, 3: 60}.get(severity, 35)
+  elif isinstance(severity, str):
+    severity_seed = {
+      "low": 20,
+      "medium": 40,
+      "high": 60,
+      "critical": 75,
+    }.get(severity.lower(), 35)
+
+  score = severity_seed + (vt_malicious * 6) + (vt_suspicious * 3) + int(abuse_score * 0.25)
+
+  if "brute force" in title:
+    score += 12
+  if "port scan" in title:
+    score += 8
+  if "malicious ip" in title or "known malicious" in title:
+    score += 20
+  if "dns tunneling" in title:
+    score += 18
+
+  score = max(0, min(100, score))
+  severity_label = _normalize_severity_label(score)
+
+  behavior_summary = " ".join(
+    part for part in [
+      str(alert.get("title") or alert.get("alert_type") or "").strip(),
+      description.strip(),
+    ] if part
+  )
+
+  if not behavior_summary:
+    behavior_summary = "Suspicious activity observed with correlated threat-intel context."
+
+  ttps = get_ttps(behavior_summary)
+
+  reasoning = (
+    f"Score {score} is based on alert severity, external reputation, and behavioral indicators. "
+    f"VirusTotal malicious={vt_malicious}, suspicious={vt_suspicious}; AbuseIPDB score={abuse_score}. "
+    f"Observed pattern: {behavior_summary[:180]}"
+  )
+
+  recommended_actions = [
+    "Validate source and destination activity in firewall, EDR, and authentication logs.",
+    "Contain affected endpoint or account if additional malicious evidence appears.",
+    "Create or tune a detection rule for this behavior pattern if true positive.",
+  ]
+
+  return {
+    "score": score,
+    "severity_label": severity_label,
+    "behavior_summary": behavior_summary,
+    "ttps": ttps,
+    "reasoning": reasoning,
+    "recommended_actions": recommended_actions,
+  }
+
+
+def reason(context: dict[str, Any]) -> dict[str, Any]:
+  """Return a TriageResult-compatible partial from correlated context."""
+  llm_prompt = build_correlation_prompt(context)
+  model_output = _heuristic_reasoning(context)
+  timeline = timeline_builder(context.get("related_logs", []))
+
+  return {
+    "alert_id": context.get("alert", {}).get("alert_id") or context.get("alert", {}).get("id", ""),
+    "score": model_output["score"],
+    "severity_label": model_output["severity_label"],
+    "ttps": model_output["ttps"],
+    "timeline": timeline,
+    "reasoning": model_output["reasoning"],
+    "recommended_actions": model_output["recommended_actions"],
+    "correlation_prompt": llm_prompt,
+  }
 
 
 def enrich(alert: Any) -> dict[str, Any]:

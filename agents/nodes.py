@@ -5,7 +5,7 @@ Node functions for the LangGraph workflow.
 import json
 
 from schemas.models import RawAlert, TriageResult
-from tools.enrichment import enrich
+from tools.enrichment import enrich, reason
 
 
 def ingest_alert(state):
@@ -124,31 +124,26 @@ def enrichment_node(state):
 
 
 def scoring_node(state):
-    """
-    Temporary scoring node.
-
-    Day 4 requirement:
-    Return a hardcoded score of 50.
-    """
-
     alert = state["alert"]
+    enriched = state.get("enriched", {})
+
+    triage_partial = reason(enriched)
 
     triage = TriageResult(
-        alert_id=alert.alert_id,
-        score=50,
-        severity_label="medium",
-        ttps=[],
-        timeline=[
-            f"{alert.timestamp} - Alert received"
-        ],
-        reasoning="Hardcoded score placeholder.",
-        recommended_actions=[
-            "Investigate source IP",
-            "Review related logs"
-        ],
+        alert_id=triage_partial.get("alert_id") or alert.alert_id,
+        score=int(triage_partial.get("score", 50)),
+        severity_label=triage_partial.get("severity_label", "medium"),
+        ttps=triage_partial.get("ttps", []),
+        timeline=triage_partial.get("timeline", [f"{alert.timestamp} - Alert received"]),
+        reasoning=triage_partial.get("reasoning", "No reasoning generated."),
+        recommended_actions=triage_partial.get(
+            "recommended_actions",
+            ["Investigate source IP", "Review related logs"],
+        ),
     )
 
     state["triage_result"] = triage
+    state["correlation_prompt"] = triage_partial.get("correlation_prompt")
 
     return state
 
@@ -178,7 +173,17 @@ def generate_report(state):
 """
 
     for event in triage.timeline:
-        markdown += f"- {event}\n"
+        if isinstance(event, dict):
+            markdown += (
+                f"- {event.get('timestamp', 'unknown time')} | "
+                f"{event.get('source', 'unknown source')} | "
+                f"{event.get('event', 'unknown event')}"
+            )
+            if event.get("message"):
+                markdown += f" - {event['message']}"
+            markdown += "\n"
+        else:
+            markdown += f"- {event}\n"
 
     markdown += f"""
 
