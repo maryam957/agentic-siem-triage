@@ -32,6 +32,20 @@ BEHAVIOR_TTP_HINTS: list[tuple[tuple[str, ...], list[str]]] = [
   (("failed login", "authentication failure"), ["T1110"]),
 ]
 
+HIGH_TTP_HINTS = {
+  "T1041",
+  "T1048.003",
+  "T1071",
+  "T1071.004",
+  "T1105",
+  "T1021.004",
+}
+MEDIUM_TTP_HINTS = {
+  "T1046",
+  "T1110",
+  "T1110.001",
+}
+
 
 def _get_api_key(env_var: str) -> str:
   key = os.getenv(env_var)
@@ -405,12 +419,135 @@ def _compact_context_for_prompt(context: dict[str, Any]) -> dict[str, Any]:
   }
 
 
-def _normalize_severity_label(score: int) -> str:
+def route_alert(score: int) -> str:
   if score >= 70:
     return "high"
   if score >= 40:
     return "medium"
   return "low"
+
+
+def _clamp_score(value: Any) -> int:
+  try:
+    return max(0, min(100, int(value)))
+  except (TypeError, ValueError):
+    return 0
+
+
+def _extract_abuse_score(context: dict[str, Any]) -> int:
+  abuse = context.get("abuseipdb", {}) or {}
+  if isinstance(abuse, Mapping):
+    if "abuse_confidence_score" in abuse:
+      return _clamp_score(abuse.get("abuse_confidence_score", 0))
+    if "abuse_score" in abuse:
+      return _clamp_score(abuse.get("abuse_score", 0))
+
+  return _clamp_score(context.get("abuse_score", 0))
+
+
+def _extract_vt_score(context: dict[str, Any]) -> int:
+  vt = context.get("virustotal", {}) or {}
+  if not isinstance(vt, Mapping):
+    return 0
+
+  stats = vt.get("last_analysis_stats", {}) or {}
+  malicious = _clamp_score(stats.get("malicious", 0))
+  suspicious = _clamp_score(stats.get("suspicious", 0))
+  return min(100, (malicious * 25) + (suspicious * 10))
+
+
+def _ttp_severity_score(context: dict[str, Any], reasoning: str) -> int:
+  ttps = context.get("ttps", []) or []
+  if isinstance(ttps, str):
+    ttps = [ttps]
+
+  severity = 0
+  for ttp in ttps:
+    technique_id = str(ttp).upper()
+    if any(technique_id == hint or technique_id.startswith(f"{hint}.") for hint in HIGH_TTP_HINTS):
+      severity = max(severity, 100)
+    elif any(technique_id == hint or technique_id.startswith(f"{hint}.") for hint in MEDIUM_TTP_HINTS):
+      severity = max(severity, 70)
+    else:
+      severity = max(severity, 50)
+
+  if severity:
+    return severity
+
+  text = f"{reasoning} {context.get('behavior_summary', '')}".lower()
+  if any(keyword in text for keyword in ("dns tunneling", "command and control", "exfiltration", "known malicious")):
+    return 100
+  if any(keyword in text for keyword in ("brute force", "failed login", "credential access")):
+    return 75
+  if any(keyword in text for keyword in ("port scan", "reconnaissance")):
+    return 50
+  return 35
+
+
+def _log_anomaly_score(context: dict[str, Any], reasoning: str) -> int:
+  anomaly_count = 0
+
+  related_logs = context.get("related_logs", []) or []
+  for log in related_logs:
+    if not isinstance(log, Mapping):
+      continue
+    event_text = f"{log.get('event', '')} {log.get('message', '')}".lower()
+    if any(keyword in event_text for keyword in ("failed", "suspicious", "correlated", "scan", "tunneling", "malicious")):
+      anomaly_count += 1
+
+  alert = context.get("alert", {}) or {}
+  raw_event = {}
+  if isinstance(alert, Mapping):
+    raw_event = alert.get("raw_event") or alert.get("raw_payload") or {}
+  if isinstance(raw_event, Mapping):
+    attempts = _clamp_score(raw_event.get("attempts") or raw_event.get("failed_logins") or 0)
+    if attempts >= 50:
+      anomaly_count += 3
+    elif attempts >= 20:
+      anomaly_count += 2
+    elif attempts >= 5:
+      anomaly_count += 1
+
+    ports_scanned = raw_event.get("ports_scanned")
+    if isinstance(ports_scanned, list):
+      if len(ports_scanned) >= 8:
+        anomaly_count += 3
+      elif len(ports_scanned) >= 4:
+        anomaly_count += 2
+
+    queries = _clamp_score(raw_event.get("queries") or 0)
+    if queries >= 300:
+      anomaly_count += 3
+    elif queries >= 100:
+      anomaly_count += 2
+
+    bytes_sent = _clamp_score(raw_event.get("bytes_sent") or 0)
+    bytes_received = _clamp_score(raw_event.get("bytes_received") or 0)
+    if bytes_sent >= 500000 and bytes_received <= 10000:
+      anomaly_count += 2
+
+    if raw_event.get("ioc_source"):
+      anomaly_count += 2
+
+  if any(keyword in reasoning.lower() for keyword in ("rare asn", "known bad", "malicious", "tunneling")):
+    anomaly_count += 1
+
+  return min(100, anomaly_count * 20)
+
+
+def score_alert(context: dict[str, Any], reasoning: str) -> int:
+  abuse_score = _extract_abuse_score(context)
+  vt_score = _extract_vt_score(context)
+  ttp_score = _ttp_severity_score(context, reasoning)
+  log_score = _log_anomaly_score(context, reasoning)
+
+  weighted_score = (
+    (abuse_score * 0.30)
+    + (vt_score * 0.30)
+    + (ttp_score * 0.25)
+    + (log_score * 0.15)
+  )
+  return int(round(max(0, min(100, weighted_score))))
 
 
 def _heuristic_reasoning(context: dict[str, Any]) -> dict[str, Any]:
@@ -426,32 +563,6 @@ def _heuristic_reasoning(context: dict[str, Any]) -> dict[str, Any]:
   abuse = context.get("abuseipdb", {}) or {}
   abuse_score = int(abuse.get("abuse_confidence_score", 0) or 0)
 
-  severity = alert.get("severity")
-  severity_seed = 0
-  if isinstance(severity, int):
-    severity_seed = {1: 20, 2: 40, 3: 60}.get(severity, 35)
-  elif isinstance(severity, str):
-    severity_seed = {
-      "low": 20,
-      "medium": 40,
-      "high": 60,
-      "critical": 75,
-    }.get(severity.lower(), 35)
-
-  score = severity_seed + (vt_malicious * 6) + (vt_suspicious * 3) + int(abuse_score * 0.25)
-
-  if "brute force" in title:
-    score += 12
-  if "port scan" in title:
-    score += 8
-  if "malicious ip" in title or "known malicious" in title:
-    score += 20
-  if "dns tunneling" in title:
-    score += 18
-
-  score = max(0, min(100, score))
-  severity_label = _normalize_severity_label(score)
-
   behavior_summary = " ".join(
     part for part in [
       str(alert.get("title") or alert.get("alert_type") or "").strip(),
@@ -463,6 +574,10 @@ def _heuristic_reasoning(context: dict[str, Any]) -> dict[str, Any]:
     behavior_summary = "Suspicious activity observed with correlated threat-intel context."
 
   ttps = get_ttps(behavior_summary)
+  scoring_context = dict(context)
+  scoring_context["ttps"] = ttps
+  scoring_context["behavior_summary"] = behavior_summary
+  score = score_alert(scoring_context, reasoning=behavior_summary)
 
   reasoning = (
     f"Score {score} is based on alert severity, external reputation, and behavioral indicators. "
@@ -478,7 +593,7 @@ def _heuristic_reasoning(context: dict[str, Any]) -> dict[str, Any]:
 
   return {
     "score": score,
-    "severity_label": severity_label,
+    "severity_label": route_alert(score),
     "behavior_summary": behavior_summary,
     "ttps": ttps,
     "reasoning": reasoning,

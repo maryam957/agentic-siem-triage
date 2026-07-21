@@ -10,7 +10,7 @@ agentic-siem-triage/
 ├── agents/          ← LangGraph nodes
 ├── tools/           ← API integrations
 ├── schemas/         ← shared data contracts
-├── ui/              ← HITL dashboard
+├── backend/         ← HITL dashboard backend
 ├── reports/         ← generated outputs
 ├── main.py
 ├── requirements.txt
@@ -28,7 +28,7 @@ python main.py
 ## Run dashboard
 
 ```bash
-uvicorn ui.app:app --reload
+uvicorn backend.app:app --reload
 ```
 
 ## Branches

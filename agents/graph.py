@@ -39,6 +39,7 @@ class PipelineState(TypedDict, total=False):
     """
 
     alert_path: str
+    alert_data: dict
     alert: RawAlert
     enriched: EnrichedContext
     triage_result: TriageResult

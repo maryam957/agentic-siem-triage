@@ -6,9 +6,9 @@ export default defineConfig({
   server: {
     port: 1574,
     // Proxy backend calls through the dev server so the browser only ever
-    // talks to localhost:1574 — avoids CORS entirely since ui/app.py has no
-    // CORS middleware configured.
+    // talks to localhost:1574 — avoids CORS entirely.
     proxy: {
+      '/alerts': 'http://localhost:8000',
       '/review': 'http://localhost:8000',
       '/approve': 'http://localhost:8000',
       '/override': 'http://localhost:8000',

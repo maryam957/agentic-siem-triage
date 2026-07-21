@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "concurrently -n backend,frontend,seed -c yellow,cyan,green --kill-others-on-fail=false \"npm:dev:backend\" \"npm:dev:frontend\" \"npm:seed\"",
     "dev:frontend": "vite",
-    "dev:backend": "cd .. && \".venv/Scripts/python.exe\" -m uvicorn ui.app:app --reload --port 8000",
+    "dev:backend": "cd .. && \".venv/Scripts/python.exe\" -m uvicorn backend.app:app --reload --port 8000",
     "seed": "wait-on http-get://localhost:8000/health -t 30000 && cd .. && cross-env PYTHONIOENCODING=utf-8 \".venv/Scripts/python.exe\" main.py",
     "build": "vite build",
     "preview": "vite preview"

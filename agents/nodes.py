@@ -3,9 +3,13 @@ Node functions for the LangGraph workflow.
 """
 
 import json
+from pathlib import Path
 
 from schemas.models import RawAlert, TriageResult
 from tools.enrichment import enrich, reason
+
+
+REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
 
 
 def ingest_alert(state):
@@ -14,14 +18,16 @@ def ingest_alert(state):
     Supports a file containing either one alert or a list of alerts.
     """
 
-    alert_path = state["alert_path"]
+    data = state.get("alert_data")
+    if data is None:
+        alert_path = state["alert_path"]
 
-    with open(alert_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        with open(alert_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    # Use the first alert if the file contains a list
-    if isinstance(data, list):
-        data = data[0]
+        # Use the first alert if the file contains a list
+        if isinstance(data, list):
+            data = data[0]
 
     raw = data.get("raw_event", {})
 
@@ -60,65 +66,10 @@ def enrichment_node(state):
 
     state["enriched"] = enriched
 
-    print("\n" + "=" * 70)
-    print("🔍 ENRICHMENT RESULT")
-    print("=" * 70)
-
-    print(f"Source IP      : {enriched['ip']}")
-    print(f"Host           : {enriched['host']}")
-
-    print("\nVirusTotal")
-    print("-" * 70)
-    vt = enriched["virustotal"]
-    for key, value in vt.items():
-        if key != "raw":
-            print(f"{key:22}: {value}")
-
-    print("\nAbuseIPDB")
-    print("-" * 70)
-    abuse = enriched["abuseipdb"]
-    for key, value in abuse.items():
-        if key != "raw":
-            print(f"{key:22}: {value}")
-
-    print("\nRelated Logs")
-    print("-" * 70)
-    for i, log in enumerate(enriched["related_logs"], start=1):
-        print(f"[{i}] {log['timestamp']}")
-        print(f"    Source : {log['source']}")
-        print(f"    Event  : {log['event']}")
-        print(f"    Message: {log['message']}")
-        print()
-
-    print("=" * 70)
-
-    print(f"Source IP      : {enriched['ip']}")
-    print(f"Host           : {enriched['host']}")
-
-    print("\nVirusTotal")
-    print("-" * 70)
-    vt = enriched["virustotal"]
-    for key, value in vt.items():
-        if key != "raw":
-            print(f"{key:22}: {value}")
-
-    print("\nAbuseIPDB")
-    print("-" * 70)
-    abuse = enriched["abuseipdb"]
-    for key, value in abuse.items():
-        if key != "raw":
-            print(f"{key:22}: {value}")
-
-    print("\nRelated Logs")
-    print("-" * 70)
-    for i, log in enumerate(enriched["related_logs"], start=1):
-        print(f"[{i}] {log['timestamp']}")
-        print(f"    Source : {log['source']}")
-        print(f"    Event  : {log['event']}")
-        print(f"    Message: {log['message']}")
-        print()
-
-    print("=" * 70)
+    print(
+        f"Enriched {alert.alert_id}: source_ip={enriched['ip']} host={enriched['host']} "
+        f"related_logs={len(enriched['related_logs'])}"
+    )
 
     return state
 
@@ -196,6 +147,12 @@ def generate_report(state):
     for action in triage.recommended_actions:
         markdown += f"- {action}\n"
 
-    print(markdown)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = REPORTS_DIR / f"{triage.alert_id}.md"
+    report_path.write_text(markdown, encoding="utf-8")
+
+    state["report_path"] = str(report_path)
+
+    print(f"Generated report: {report_path}")
 
     return state

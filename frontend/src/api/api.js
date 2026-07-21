@@ -11,40 +11,11 @@ const client = axios.create({
 })
 
 /**
- * `/review` renders an HTML table (see ui/app.py) rather than JSON, so we
- * parse it into the alert shape the rest of the UI expects. Only
- * alert_id / score / severity_label are present in that table today —
- * ttps, reasoning, timeline, and recommended_actions aren't rendered by
- * the backend yet, so those fields come back undefined here.
- */
-function parseReviewHtml(html) {
-  const doc = new DOMParser().parseFromString(html, 'text/html')
-  const rows = Array.from(doc.querySelectorAll('table tr')).slice(1) // skip header row
-
-  const alerts = []
-  for (const row of rows) {
-    const cells = row.querySelectorAll('td')
-    if (cells.length < 3) continue // "no alerts" placeholder row (single colspan cell)
-
-    const alert_id = cells[0].textContent.trim()
-    if (!alert_id) continue
-
-    alerts.push({
-      alert_id,
-      score: Number(cells[1].textContent.trim()),
-      severity_label: cells[2].textContent.trim(),
-    })
-  }
-  return alerts
-}
-
-/**
- * Fetch alerts currently pending human analyst review
- * (medium, high, and critical severity).
+ * Fetch alerts currently pending human analyst review.
  */
 export async function getAlerts() {
-  const response = await client.get('/review')
-  return parseReviewHtml(response.data)
+  const response = await client.get('/alerts')
+  return response.data
 }
 
 /**

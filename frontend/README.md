@@ -14,7 +14,7 @@ npm run dev
 `npm run dev` now starts **three** things together (via `concurrently`),
 so you don't need separate terminals for `uvicorn` or `python main.py`:
 
-1. **backend** — the FastAPI server (`uvicorn ui.app:app --reload --port 8000`)
+1. **backend** — the FastAPI server (`uvicorn backend.app:app --reload --port 8000`)
 2. **frontend** — the Vite dev server (`http://localhost:5173`)
 3. **seed** — waits for the backend's `/health` endpoint to respond, then
    runs `python main.py` once. `main.py` now runs the LangGraph pipeline
