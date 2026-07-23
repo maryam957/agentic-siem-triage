@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
+from pydantic import BaseModel
 
 @dataclass
 class RawAlert:
@@ -10,25 +11,24 @@ class RawAlert:
     src_port: int
     dst_port: int
     protocol: str
-    alert_type: str       # e.g. "ET SCAN Nmap"
-    severity: int         # 1-3 from Suricata
+    alert_type: str
+    severity: int
     affected_host: str
     raw_payload: dict
 
 @dataclass
 class EnrichedContext:
     alert: RawAlert
-    ip_reputation: dict   # VirusTotal response
-    abuse_score: int      # AbuseIPDB score 0-100
-    related_logs: list    # last 24hr logs for this IP
+    ip_reputation: dict
+    abuse_score: int
+    related_logs: list
     whois_info: dict
 
-@dataclass
-class TriageResult:
+class TriageResult(BaseModel):        # ← Pydantic, not dataclass
     alert_id: str
-    score: int            # 0-100
-    severity_label: str   # "low" / "medium" / "high"
-    ttps: list            # MITRE ATT&CK IDs e.g. ["T1046", "T1110"]
-    timeline: list        # ordered list of events
-    reasoning: str        # LLM explanation
-    recommended_actions: list
+    score: int
+    severity_label: str
+    ttps: list = []
+    timeline: list = []
+    reasoning: str = ""
+    recommended_actions: list = []

@@ -53,7 +53,13 @@ def load_all_alerts() -> list[TriageResult]:
         rows = con.execute(
             "SELECT data FROM alerts ORDER BY created_at DESC"
         ).fetchall()
-    return [TriageResult.model_validate_json(row["data"]) for row in rows]
+    results = []
+    for row in rows:
+        try:
+            results.append(TriageResult.model_validate_json(row["data"]))
+        except Exception:
+            continue
+    return results
 
 
 def load_alert(alert_id: str) -> Optional[TriageResult]:
@@ -63,8 +69,10 @@ def load_alert(alert_id: str) -> Optional[TriageResult]:
         ).fetchone()
     if row is None:
         return None
-    return TriageResult.model_validate_json(row["data"])
-
+    try:
+        return TriageResult.model_validate_json(row["data"])
+    except Exception:
+        return None
 
 def set_alert_status(alert_id: str, status: str) -> None:
     with _connect() as con:
@@ -202,9 +210,7 @@ async def override(alert_id: str, new_score: int = 90):
     else:
         new_severity = "low"
 
-    updated = alert.model_copy(
-        update={"score": new_score, "severity_label": new_severity}
-    )
+    updated = alert.model_copy(update={"score": new_score, "severity_label": new_severity})
     save_alert(updated, status="overridden")
 
     return {
