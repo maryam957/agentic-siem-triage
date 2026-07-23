@@ -1,7 +1,7 @@
 """IP threat enrichment via VirusTotal, AbuseIPDB, and Gemini LLM reasoning."""
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 import json
 import os
@@ -23,6 +23,9 @@ VIRUSTOTAL_API_URL  = "https://www.virustotal.com/api/v3/ip_addresses/{ip}"
 ABUSEIPDB_API_URL   = "https://api.abuseipdb.com/api/v2/check"
 GEMINI_API_URL      = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 REQUEST_TIMEOUT     = 30
+LOG_LOOKBACK_MINUTES = 15
+LOG_RESULT_LIMIT     = 10
+EVE_JSON_PATH        = Path(__file__).resolve().parents[1] / "eve.json"
 
 ATTACK_JSON_URL  = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
 ATTACK_JSON_PATH = Path(__file__).resolve().parent / "data" / "attack.json"
@@ -102,6 +105,413 @@ def _tokenize(text: str) -> set[str]:
     }
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _first_value(data: Mapping[str, Any], paths: list[tuple[str, ...]], default: Any = None) -> Any:
+    for path in paths:
+        current: Any = data
+        for key in path:
+            if not isinstance(current, Mapping):
+                current = None
+                break
+            current = current.get(key)
+            if current is None:
+                break
+        if current not in (None, "", [], {}):
+            return current
+    return default
+
+
+def _as_iso_timestamp(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return value
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _related_log_field_names(logs: list[dict[str, Any]]) -> list[str]:
+    preferred_order = [
+        "timestamp", "source", "event_type", "src_ip", "src_port", "dest_ip",
+        "dest_port", "proto", "app_proto", "alert", "dns", "http", "tls",
+        "flow", "message", "level", "labels", "raw_message",
+    ]
+    discovered: set[str] = set()
+    for log in logs:
+        if isinstance(log, Mapping):
+            discovered.update(k for k, v in log.items() if v not in (None, "", [], {}))
+    ordered = [key for key in preferred_order if key in discovered]
+    ordered.extend(sorted(discovered - set(ordered)))
+    return ordered
+
+
+def _normalize_related_log(log: Mapping[str, Any], source: str) -> dict[str, Any]:
+    normalized = {
+        "timestamp": _as_iso_timestamp(_first_value(log, [("timestamp",)], None)
+                        or _first_value(log, [("@timestamp",)], None)
+                        or _first_value(log, [("event", "created")], None)
+                        or _first_value(log, [("event", "ingested")], None)),
+        "source": source,
+        "host": _first_value(log, [
+            ("host", "name"),
+            ("host", "hostname"),
+            ("hostname",),
+            ("computer_name",),
+            ("device", "name"),
+            ("observer", "name"),
+        ]),
+        "ip": _first_value(log, [
+            ("source", "ip"),
+            ("client", "ip"),
+            ("destination", "ip"),
+            ("host", "ip"),
+            ("ip",),
+            ("src_ip",),
+            ("dst_ip",),
+            ("source_ip",),
+            ("destination_ip",),
+        ]),
+        "event": _first_value(log, [
+            ("event", "action"),
+            ("event", "category"),
+            ("event", "type"),
+            ("event", "dataset"),
+            ("rule", "name"),
+            ("action",),
+            ("type",),
+            ("service",),
+        ]),
+        "message": _first_value(log, [
+            ("message",),
+            ("event", "original"),
+            ("log", "original"),
+            ("raw_message",),
+            ("alert", "signature"),
+            ("dns", "rrname"),
+            ("http", "hostname"),
+            ("tls", "sni"),
+        ]),
+        "level": _first_value(log, [
+            ("log", "level"),
+            ("event", "severity"),
+            ("severity",),
+            ("level",),
+            ("alert", "severity"),
+        ]),
+        "service": _first_value(log, [
+            ("service",),
+            ("event", "dataset"),
+            ("app",),
+            ("job",),
+        ]),
+        "user": _first_value(log, [
+            ("user", "name"),
+            ("user", "email"),
+            ("user",),
+            ("account", "name"),
+            ("principal", "name"),
+        ]),
+        "action": _first_value(log, [
+            ("action",),
+            ("event", "action"),
+        ]),
+        "status": _first_value(log, [
+            ("status",),
+            ("event", "outcome"),
+            ("result",),
+        ]),
+        "labels": log.get("labels") if isinstance(log.get("labels"), Mapping) else None,
+        "raw_message": _first_value(log, [
+            ("raw_message",),
+            ("event", "original"),
+            ("message",),
+        ]),
+    }
+
+    extras = {
+        key: value
+        for key, value in log.items()
+        if key not in normalized and value not in (None, "", [], {})
+    }
+    normalized.update(extras)
+    return normalized
+
+
+def _elasticsearch_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("ELASTICSEARCH_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+    return headers
+
+
+def _elasticsearch_auth() -> tuple[str, str] | None:
+    username = os.getenv("ELASTICSEARCH_USERNAME")
+    password = os.getenv("ELASTICSEARCH_PASSWORD")
+    if username and password:
+        return username, password
+    return None
+
+
+def _build_elasticsearch_query(ip: str | None, host: str | None, lookback_minutes: int, limit: int) -> dict[str, Any] | None:
+    should: list[dict[str, Any]] = []
+    if ip:
+        should.extend([
+            {"term": {"source.ip": ip}},
+            {"term": {"client.ip": ip}},
+            {"term": {"destination.ip": ip}},
+            {"term": {"host.ip": ip}},
+            {"term": {"src_ip": ip}},
+            {"term": {"dst_ip": ip}},
+            {"term": {"ip": ip}},
+            {"multi_match": {
+                "query": ip,
+                "fields": ["message", "event.original", "log.original", "source.ip", "client.ip", "destination.ip", "host.ip", "src_ip", "dst_ip"],
+                "lenient": True,
+            }},
+        ])
+    if host:
+        should.extend([
+            {"term": {"host.name": host}},
+            {"term": {"host.hostname": host}},
+            {"term": {"hostname": host}},
+            {"term": {"computer_name": host}},
+            {"term": {"device.name": host}},
+            {"multi_match": {
+                "query": host,
+                "fields": ["host.name", "host.hostname", "hostname", "computer_name", "device.name", "message", "event.original", "log.original"],
+                "lenient": True,
+            }},
+        ])
+
+    if not should:
+        return None
+
+    return {
+        "size": limit,
+        "track_total_hits": False,
+        "sort": [
+            {"@timestamp": {"order": "desc", "unmapped_type": "date"}},
+            {"timestamp": {"order": "desc", "unmapped_type": "date"}},
+        ],
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": f"now-{lookback_minutes}m",
+                                "lte": "now",
+                            }
+                        }
+                    }
+                ],
+                "should": should,
+                "minimum_should_match": 1,
+            }
+        },
+    }
+
+
+def _query_elasticsearch(ip: str | None, host: str | None, limit: int, lookback_minutes: int) -> list[dict[str, Any]]:
+    base_url = os.getenv("ELASTICSEARCH_URL", "").rstrip("/")
+    if not base_url:
+        raise ValueError("ELASTICSEARCH_URL is not set")
+
+    index_name = os.getenv("ELASTICSEARCH_INDEX", "*")
+    query = _build_elasticsearch_query(ip, host, lookback_minutes, limit)
+    if query is None:
+        return []
+
+    response = requests.post(
+        f"{base_url}/{index_name}/_search",
+        headers=_elasticsearch_headers(),
+        auth=_elasticsearch_auth(),
+        json=query,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    hits = payload.get("hits", {}).get("hits", [])
+    return [
+        _normalize_related_log(hit.get("_source", {}), f"elasticsearch:{hit.get('_index', index_name)}")
+        for hit in hits
+        if isinstance(hit, Mapping)
+    ]
+
+
+def _build_loki_query(ip: str | None, host: str | None) -> str | None:
+    template = os.getenv("LOKI_QUERY_TEMPLATE")
+    if template:
+        query = template.format(ip=ip or "", host=host or "")
+        return query.strip() or None
+
+    selector = os.getenv("LOKI_SELECTOR", '{job=~".+"}')
+    filters: list[str] = []
+    if ip:
+        filters.append(f'|= "{ip}"')
+    if host:
+        filters.append(f'|= "{host}"')
+    query = " ".join([selector, *filters]).strip()
+    return query or None
+
+
+def _normalize_eve_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    alert = entry.get("alert", {}) if isinstance(entry.get("alert"), Mapping) else {}
+    dns = entry.get("dns", {}) if isinstance(entry.get("dns"), Mapping) else {}
+    http = entry.get("http", {}) if isinstance(entry.get("http"), Mapping) else {}
+    tls = entry.get("tls", {}) if isinstance(entry.get("tls"), Mapping) else {}
+    flow = entry.get("flow", {}) if isinstance(entry.get("flow"), Mapping) else {}
+
+    normalized = {
+        "timestamp": _as_iso_timestamp(entry.get("timestamp")),
+        "source": f"eve.json:{entry.get('event_type', 'unknown')}",
+        "event_type": entry.get("event_type"),
+        "src_ip": entry.get("src_ip") or flow.get("src_ip"),
+        "src_port": entry.get("src_port") or flow.get("src_port"),
+        "dest_ip": entry.get("dest_ip") or entry.get("dst_ip") or flow.get("dest_ip") or flow.get("dst_ip"),
+        "dest_port": entry.get("dest_port") or entry.get("dst_port") or flow.get("dest_port") or flow.get("dst_port"),
+        "proto": entry.get("proto") or flow.get("proto"),
+        "app_proto": entry.get("app_proto"),
+        "message": alert.get("signature") or dns.get("rrname") or http.get("hostname") or tls.get("sni"),
+        "alert": alert or None,
+        "dns": dns or None,
+        "http": http or None,
+        "tls": tls or None,
+        "flow": flow or None,
+        "raw_message": entry,
+    }
+    return {key: value for key, value in normalized.items() if value not in (None, "", [], {})}
+
+
+def _query_eve_json(ip: str | None, host: str | None, limit: int, lookback_minutes: int) -> list[dict[str, Any]]:
+    path = Path(os.getenv("EVE_JSON_PATH", str(EVE_JSON_PATH)))
+    if not path.exists():
+        raise ValueError(f"EVE_JSON_PATH does not exist: {path}")
+
+    cutoff = datetime.now(timezone.utc).timestamp() - (lookback_minutes * 60)
+    candidates: list[tuple[datetime, dict[str, Any]]] = []
+
+    for line in path.open("r", encoding="utf-8", errors="ignore"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(entry, Mapping):
+            continue
+
+        event_time = _parse_timestamp(entry.get("timestamp"))
+        if event_time is not datetime.max and event_time.timestamp() < cutoff:
+            continue
+
+        entry_ip_candidates = {
+            str(value)
+            for value in [
+                entry.get("src_ip"),
+                entry.get("dest_ip"),
+                entry.get("dst_ip"),
+                entry.get("ip"),
+                (entry.get("flow") or {}).get("src_ip") if isinstance(entry.get("flow"), Mapping) else None,
+                (entry.get("flow") or {}).get("dest_ip") if isinstance(entry.get("flow"), Mapping) else None,
+            ]
+            if isinstance(value, str) and value
+        }
+
+        entry_host = None
+        if isinstance(entry.get("dns"), Mapping):
+            entry_host = entry["dns"].get("rrname")
+        if not entry_host and isinstance(entry.get("http"), Mapping):
+            entry_host = entry["http"].get("hostname")
+        if not entry_host and isinstance(entry.get("tls"), Mapping):
+            entry_host = entry["tls"].get("sni")
+
+        if ip and ip not in entry_ip_candidates:
+            continue
+        if host and host not in {entry_host, entry.get("host"), entry.get("hostname")}:
+            continue
+
+        normalized = _normalize_eve_entry(entry)
+        event_time = _parse_timestamp(normalized.get("timestamp"))
+        candidates.append((event_time, normalized))
+
+    candidates.sort(key=lambda item: item[0])
+    return [entry for event_time, entry in candidates if event_time is datetime.max or event_time.timestamp() >= cutoff][-limit:]
+
+
+def _query_loki(ip: str | None, host: str | None, limit: int, lookback_minutes: int) -> list[dict[str, Any]]:
+    base_url = os.getenv("LOKI_URL", "").rstrip("/")
+    if not base_url:
+        raise ValueError("LOKI_URL is not set")
+
+    query = _build_loki_query(ip, host)
+    if query is None:
+        return []
+
+    end = datetime.now(timezone.utc)
+    start = end.timestamp() - (lookback_minutes * 60)
+    params = {
+        "query": query,
+        "limit": limit,
+        "direction": "backward",
+        "start": int(start * 1_000_000_000),
+        "end": int(end.timestamp() * 1_000_000_000),
+    }
+
+    headers = {"Accept": "application/json"}
+    tenant_id = os.getenv("LOKI_TENANT_ID")
+    if tenant_id:
+        headers["X-Scope-OrgID"] = tenant_id
+
+    api_token = os.getenv("LOKI_API_TOKEN")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    response = requests.get(
+        f"{base_url}/loki/api/v1/query_range",
+        headers=headers,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    results: list[dict[str, Any]] = []
+    for stream in payload.get("data", {}).get("result", []):
+        labels = stream.get("stream", {}) if isinstance(stream, Mapping) else {}
+        for raw_timestamp, line in stream.get("values", [])[:limit]:
+            record: dict[str, Any]
+            try:
+                parsed = json.loads(line)
+                record = parsed if isinstance(parsed, dict) else {"message": line}
+            except json.JSONDecodeError:
+                record = {"message": line}
+
+            normalized = _normalize_related_log(record, "loki")
+            normalized["timestamp"] = _as_iso_timestamp(int(raw_timestamp) / 1_000_000_000)
+            normalized["labels"] = labels
+            normalized["raw_message"] = line
+            results.append(normalized)
+            if len(results) >= limit:
+                return results
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # External API calls
 # ---------------------------------------------------------------------------
@@ -174,30 +584,55 @@ def check_ip_abuseipdb(ip: str, max_age_days: int = 90) -> dict:
 
 def get_related_logs(ip: str | None, host: str | None) -> list[dict[str, Any]]:
     """Return related log events for the given IP/host."""
+    lookback_minutes = _int_env("RELATED_LOG_LOOKBACK_MINUTES", LOG_LOOKBACK_MINUTES)
+    limit = _int_env("RELATED_LOG_LIMIT", LOG_RESULT_LIMIT)
+    backend = os.getenv("RELATED_LOG_BACKEND", "").strip().lower()
+
+    if backend in {"eve", "evejson", "eve.json"} or (not backend and Path(os.getenv("EVE_JSON_PATH", str(EVE_JSON_PATH))).exists()):
+        try:
+            return _query_eve_json(ip, host, limit, lookback_minutes)
+        except Exception as exc:
+            print(f"[related_logs] eve.json lookup failed: {exc}")
+
+    if backend in {"elasticsearch", "es"} or (not backend and os.getenv("ELASTICSEARCH_URL")):
+        try:
+            return _query_elasticsearch(ip, host, limit, lookback_minutes)
+        except Exception as exc:
+            print(f"[related_logs] Elasticsearch lookup failed: {exc}")
+
+    if backend in {"loki"} or (not backend and os.getenv("LOKI_URL")):
+        try:
+            return _query_loki(ip, host, limit, lookback_minutes)
+        except Exception as exc:
+            print(f"[related_logs] Loki lookup failed: {exc}")
+
     return [
         {
             "timestamp": "2026-07-14T08:12:09Z",
-            "source":    "Windows Security",
+            "source":    "local-fallback",
             "host":      host,
             "ip":        ip,
             "event":     "authentication failure",
             "message":   "Multiple failed logon attempts from the same source.",
+            "level":     "warning",
         },
         {
             "timestamp": "2026-07-14T08:12:41Z",
-            "source":    "EDR",
+            "source":    "local-fallback",
             "host":      host,
             "ip":        ip,
             "event":     "suspicious network connection",
             "message":   "Process spawned a network session matching the alert context.",
+            "level":     "warning",
         },
         {
             "timestamp": "2026-07-14T08:13:02Z",
-            "source":    "SIEM Correlation",
+            "source":    "local-fallback",
             "host":      host,
             "ip":        ip,
             "event":     "correlated activity",
             "message":   "Activity tied together by source IP and affected host.",
+            "level":     "info",
         },
     ]
 
@@ -297,6 +732,7 @@ def _compact_context(context: dict[str, Any]) -> dict[str, Any]:
     vt        = context.get("virustotal", {}) or {}
     vt_stats  = vt.get("last_analysis_stats", {}) if isinstance(vt, Mapping) else {}
     abuse     = context.get("abuseipdb", {}) or {}
+    related_logs = timeline_builder(context.get("related_logs", []))
 
     return {
         "alert": {
@@ -328,7 +764,8 @@ def _compact_context(context: dict[str, Any]) -> dict[str, Any]:
             "last_reported_at":       abuse.get("last_reported_at"),
             "is_tor":                 abuse.get("is_tor", False),
         },
-        "related_logs": timeline_builder(context.get("related_logs", []))[-10:],
+        "related_logs": related_logs[-10:],
+        "related_log_fields": _related_log_field_names(related_logs[-10:]),
     }
 
 
@@ -336,14 +773,19 @@ def build_correlation_prompt(context: dict[str, Any]) -> str:
     """Build the Gemini prompt for triage reasoning."""
     compact = _compact_context(context)
     return f"""
-You are a SOC Tier-2 triage assistant. Analyse the alert context below and produce a structured risk decision.
+You are a SOC Tier-2 triage assistant. Analyse the alert context below and produce a structured risk decision from Suricata EVE JSON and enrichment data.
 
 Field guide:
 - alert.title / description: what the detector flagged and why.
-- virustotal.last_analysis_stats.malicious: number of AV engines flagging this IP as malicious.
-- abuseipdb.abuse_confidence_score (0-100): higher = more community-reported abuse.
-- abuseipdb.is_tor: Tor exit nodes are commonly used for attack anonymisation.
-- related_logs: recent events tied to the same IP or host for sequence context.
+- related_logs: normalized Suricata EVE events, sorted oldest to newest.
+- related_log_fields: actual fields seen in the EVE JSON sample.
+- Common EVE fields include timestamp, event_type, src_ip, src_port, dest_ip, dest_port, proto, app_proto, alert, dns, http, tls, and flow.
+- For alert events, use alert.signature, alert.category, and alert.severity.
+- For dns events, use dns.type, dns.rrname, dns.rrtype, and dns.answers.
+- For http events, use http.hostname, http.url, http.http_method, and http.status.
+- For tls events, use tls.sni, tls.version, and certificate metadata if present.
+- For flow events, use flow.state, flow.reason, pkts_toserver, pkts_toclient, bytes_toserver, and bytes_toclient.
+- Use src_ip/dest_ip and the protocol fields to explain how the connection fits the alert.
 
 Your tasks:
 1. Estimate a triage score (0-100). Higher = higher incident risk.
@@ -666,8 +1108,9 @@ def route_alert(score: int) -> str:
 def timeline_builder(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort logs by timestamp and normalize to a flat dict per event."""
     ordered = sorted(logs or [], key=lambda x: _parse_timestamp(x.get("timestamp")))
-    return [
-        {
+    normalized: list[dict[str, Any]] = []
+    for log in ordered:
+        entry = {
             "timestamp": log.get("timestamp"),
             "source":    log.get("source"),
             "event":     log.get("event"),
@@ -675,8 +1118,12 @@ def timeline_builder(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "ip":        log.get("ip"),
             "host":      log.get("host"),
         }
-        for log in ordered
-    ]
+        for key in ("level", "service", "user", "action", "status", "labels", "raw_message"):
+            value = log.get(key)
+            if value not in (None, "", [], {}):
+                entry[key] = value
+        normalized.append(entry)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
